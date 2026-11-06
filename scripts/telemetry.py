@@ -34,6 +34,32 @@ STAGE_LABELS = {
     "pgo": "4. Profile-Guided Optimization (Go PGO)",
 }
 
+# Scorecard formula weights. Each value is the single source of truth for the
+# dimension it feeds; changing one here changes every derived score.
+SPEED_BONUS_BASE = 60.0
+SPEED_BONUS_CAP = 40.0
+SPEED_BONUS_GAIN = 15.0
+MEMORY_AFTER_BASE = 70.0
+MEMORY_AFTER_GAIN_PER_PCT = 0.3
+COST_AFTER_BASE = 50.0
+COST_AFTER_GAIN_PER_PCT = 0.5
+SAFETY_BEFORE_BASE = 80.0
+SAFETY_HAZARD_WEIGHT = 2.5
+SAFETY_AFTER_BASE = 90.0
+SAFETY_UNSAFE_WEIGHT = 10.0
+QUALITY_LINT_WEIGHT = 3.0
+HYGIENE_BEFORE_DOC_WEIGHT = 2.0
+HYGIENE_BEFORE_LOC_WEIGHT = 0.4
+HYGIENE_AFTER_DOC_WEIGHT = 1.8
+HYGIENE_AFTER_LOC_WEIGHT = 0.6
+HYGIENE_DOC_CAP = 40.0
+SIMPLICITY_BEFORE_NEST_WEIGHT = 5.0
+SIMPLICITY_BEFORE_FN_WEIGHT = 0.3
+SIMPLICITY_AFTER_NEST_FREE = 2
+SIMPLICITY_AFTER_NEST_WEIGHT = 4.0
+SIMPLICITY_AFTER_FN_FREE = 20
+SIMPLICITY_AFTER_FN_WEIGHT = 0.4
+
 LEGACY_EXTS = {
     ".c",
     ".cc",
@@ -201,6 +227,7 @@ def cmd_init(args: argparse.Namespace) -> None:
               "avg_fn_loc": None,
               "unsafe_imports": None,
               "no_unsafe": False,
+              "statement_coverage_pct": None,
               "branch_coverage_pct": None,
               "lint_warnings": None,
           },
@@ -250,53 +277,38 @@ def cmd_end_bucket(args: argparse.Namespace) -> None:
   print(f"[telemetry] Ended timer for bucket '{args.bucket}'.")
 
 
-def analyze_directory(root_dir: Path, is_go: bool) -> dict:
-  if not root_dir.exists():
-    raise TelemetryError(
-        f"Directory to scan does not exist: '{root_dir}'. Pass a valid"
-        " source directory to 'scan-codebase --dir'."
-    )
-  exts = GO_EXTS if is_go else LEGACY_EXTS
-  skip_dirs = {
-      ".git",
-      "target",
-      "build",
-      "vendor",
-      "node_modules",
-      ".venv",
-      "__pycache__",
-  }
+SKIP_DIRS = {
+    ".git",
+    "target",
+    "build",
+    "vendor",
+    "node_modules",
+    ".venv",
+    "__pycache__",
+}
 
-  files_loc = []
-  total_code = 0
-  total_comments = 0
-  examples = 0
-  max_nesting = 0
-  fn_count = 0
-  hazards = 0
-  unsafe_imports = 0
+FN_PATTERN_GO = re.compile(
+    r"^\s*func\s+(?:\([^)]*\)\s+)?(?:[A-Za-z_]\w*)\s*\("
+)
+FN_PATTERN_LEGACY = re.compile(
+    r"^\s*(?:[\w:<>~*&\s]+)\s+\w+\s*\([^;]*\)\s*(?:const)?\s*\{|"
+    r"^\s*def\s+\w+\s*\(|"
+    r"^\s*(?:subroutine|function)\s+\w+",
+    re.IGNORECASE,
+)
+HAZARD_PATTERN = re.compile(
+    r"\b(?:malloc|calloc|realloc|free|new|delete|memcpy|memset|goto|COMMON|EQUIVALENCE)\b|"
+    r"\*\s*\w+\s*=|->\w+|\bstatic\s+(?!const\b)\w+",
+)
+# "import \"unsafe\"" as a single line, or "\"unsafe\"" inside an import block.
+UNSAFE_IMPORT_PATTERN = re.compile(r'^\s*(?:import\s+)?"unsafe"\s*$')
+EXAMPLE_PATTERN = re.compile(r"^\s*func\s+Example[\w]*\s*\(")
 
-  fn_pattern_go = re.compile(
-      r"^\s*func\s+(?:\([^)]*\)\s+)?(?:[A-Za-z_]\w*)\s*\("
-  )
-  fn_pattern_legacy = re.compile(
-      r"^\s*(?:[\w:<>~*&\s]+)\s+\w+\s*\([^;]*\)\s*(?:const)?\s*\{|"
-      r"^\s*def\s+\w+\s*\(|"
-      r"^\s*(?:subroutine|function)\s+\w+",
-      re.IGNORECASE,
-  )
-  hazard_pattern = re.compile(
-      r"\b(?:malloc|calloc|realloc|free|new|delete|memcpy|memset|goto|COMMON|EQUIVALENCE)\b|"
-      r"\*\s*\w+\s*=|->\w+|\bstatic\s+(?!const\b)\w+",
-  )
-  # "import \"unsafe\"" as a single line, or "\"unsafe\"" inside an import block.
-  unsafe_import_pattern = re.compile(
-      r'^\s*(?:import\s+)?"unsafe"\s*$'
-  )
-  example_pattern = re.compile(r"^\s*func\s+Example[\w]*\s*\(")
 
+def _iter_source_files(root_dir: Path, exts: set[str]):
+  """Yield (path, lines) for every source file of an extension inside root."""
   for dirpath, dirnames, filenames in os.walk(root_dir):
-    dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+    dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
     for fname in filenames:
       fpath = Path(dirpath) / fname
       if fpath.suffix.lower() not in exts:
@@ -305,80 +317,114 @@ def analyze_directory(root_dir: Path, is_go: bool) -> dict:
         lines = fpath.read_text(encoding="utf-8", errors="ignore").splitlines()
       except OSError:
         continue
+      yield fpath, lines
 
-      file_code = 0
-      file_comment = 0
-      in_block_comment = False
-      brace_depth = 0
 
-      for line in lines:
-        stripped = line.strip()
-        if not stripped:
-          continue
+def _track_nesting(
+    line: str, suffix: str, brace_depth: int, max_nesting: int
+) -> tuple[int, int]:
+  """Update the running nesting estimate for one non-empty source line."""
+  if suffix == ".py":
+    depth = (len(line) - len(line.lstrip(" "))) // 4
+    return brace_depth, max(max_nesting, depth)
+  stripped = line.strip()
+  brace_depth += stripped.count("{") - stripped.count("}")
+  brace_depth = max(0, brace_depth)
+  return brace_depth, max(max_nesting, brace_depth)
 
-        if is_go and unsafe_import_pattern.match(stripped):
-          unsafe_imports += 1
 
-        # Block comment handling
-        if in_block_comment:
-          file_comment += 1
-          if "*/" in stripped:
-            in_block_comment = False
-          continue
+def _scan_source_file(fpath: Path, lines: list[str], is_go: bool) -> dict:
+  """Classify every line of one file into code/comment/hazard counters."""
+  suffix = fpath.suffix.lower()
+  file_code = 0
+  file_comment = 0
+  in_block_comment = False
+  brace_depth = 0
+  max_nesting = 0
+  fn_count = 0
+  hazards = 0
+  unsafe_imports = 0
+  examples = 0
 
-        if stripped.startswith("/*"):
-          file_comment += 1
-          if "*/" not in stripped[2:]:
-            in_block_comment = True
-          continue
+  for line in lines:
+    stripped = line.strip()
+    if not stripped:
+      continue
 
-        if is_go:
-          if stripped.startswith("//"):
-            file_comment += 1
-            continue
-        else:
-          if (
-              stripped.startswith("//")
-              or stripped.startswith("#")
-              or (
-                  fpath.suffix.lower() in {".f", ".f90", ".f95", ".for"}
-                  and stripped.startswith("!")
-              )
-          ):
-            file_comment += 1
-            continue
+    if is_go and UNSAFE_IMPORT_PATTERN.match(stripped):
+      unsafe_imports += 1
 
-        # Count code line
-        file_code += 1
-        if "//" in stripped:
-          file_comment += 1
+    # Block comment handling
+    if in_block_comment:
+      file_comment += 1
+      if "*/" in stripped:
+        in_block_comment = False
+      continue
 
-        # Nesting depth estimation
-        if fpath.suffix.lower() == ".py":
-          indent = len(line) - len(line.lstrip(" "))
-          depth = indent // 4
-          max_nesting = max(max_nesting, depth)
-        else:
-          brace_depth += stripped.count("{") - stripped.count("}")
-          brace_depth = max(0, brace_depth)
-          max_nesting = max(max_nesting, brace_depth)
+    if stripped.startswith("/*"):
+      file_comment += 1
+      if "*/" not in stripped[2:]:
+        in_block_comment = True
+      continue
 
-        if is_go:
-          if fn_pattern_go.match(line):
-            fn_count += 1
-          if example_pattern.match(line):
-            examples += 1
-        else:
-          if fn_pattern_legacy.match(line):
-            fn_count += 1
-          hazards += len(hazard_pattern.findall(stripped))
+    if is_go:
+      if stripped.startswith("//"):
+        file_comment += 1
+        continue
+    else:
+      if (
+          stripped.startswith("//")
+          or stripped.startswith("#")
+          or (
+              suffix in {".f", ".f90", ".f95", ".for"}
+              and stripped.startswith("!")
+          )
+      ):
+        file_comment += 1
+        continue
 
-      file_total_loc = file_code + file_comment
-      if file_total_loc > 0:
-        files_loc.append(file_total_loc)
-        total_code += file_code
-        total_comments += file_comment
+    # Count code line
+    file_code += 1
+    if "//" in stripped:
+      file_comment += 1
 
+    brace_depth, max_nesting = _track_nesting(
+        line, suffix, brace_depth, max_nesting
+    )
+
+    if is_go:
+      if FN_PATTERN_GO.match(line):
+        fn_count += 1
+      if EXAMPLE_PATTERN.match(line):
+        examples += 1
+    else:
+      if FN_PATTERN_LEGACY.match(line):
+        fn_count += 1
+      hazards += len(HAZARD_PATTERN.findall(stripped))
+
+  return {
+      "code": file_code,
+      "comment": file_comment,
+      "examples": examples,
+      "hazards": hazards,
+      "unsafe_imports": unsafe_imports,
+      "max_nesting": max_nesting,
+      "fn_count": fn_count,
+  }
+
+
+def _summarize_census(
+    files_loc: list[int],
+    total_code: int,
+    total_comments: int,
+    examples: int,
+    max_nesting: int,
+    fn_count: int,
+    hazards: int,
+    unsafe_imports: int,
+    is_go: bool,
+) -> dict:
+  """Aggregate per-file counters into the census payload for one phase."""
   num_files = len(files_loc)
   max_loc = max(files_loc) if files_loc else 0
   avg_loc = int(round(sum(files_loc) / num_files)) if num_files else 0
@@ -392,9 +438,8 @@ def analyze_directory(root_dir: Path, is_go: bool) -> dict:
       if total_code > 0
       else None
   )
-  avg_fn_loc = (
-      int(round(total_code / max(1, fn_count))) if total_code > 0 else None
-  )
+  # A file with code but no recognizable function must not fake an average.
+  avg_fn_loc = int(round(total_code / fn_count)) if fn_count > 0 else None
   measured_nesting = (
       max(1, min(max_nesting, 12 if is_go else 15)) if num_files > 0 else None
   )
@@ -412,8 +457,9 @@ def analyze_directory(root_dir: Path, is_go: bool) -> dict:
         "examples": examples,
         "max_nesting_depth": measured_nesting,
         "avg_fn_loc": avg_fn_loc,
+        # Safety is unknown, not proven safe, when nothing was scanned.
         "unsafe_imports": unsafe_imports if num_files > 0 else None,
-        "no_unsafe": unsafe_imports == 0,
+        "no_unsafe": (unsafe_imports == 0) if num_files > 0 else None,
     }
   return {
       "scanned": num_files > 0,
@@ -431,6 +477,49 @@ def analyze_directory(root_dir: Path, is_go: bool) -> dict:
   }
 
 
+def analyze_directory(root_dir: Path, is_go: bool) -> dict:
+  if not root_dir.exists():
+    raise TelemetryError(
+        f"Directory to scan does not exist: '{root_dir}'. Pass a valid"
+        " source directory to 'scan-codebase --dir'."
+    )
+  exts = GO_EXTS if is_go else LEGACY_EXTS
+
+  files_loc: list[int] = []
+  total_code = 0
+  total_comments = 0
+  examples = 0
+  max_nesting = 0
+  fn_count = 0
+  hazards = 0
+  unsafe_imports = 0
+
+  for fpath, lines in _iter_source_files(root_dir, exts):
+    stats = _scan_source_file(fpath, lines, is_go)
+    file_total_loc = stats["code"] + stats["comment"]
+    if file_total_loc > 0:
+      files_loc.append(file_total_loc)
+      total_code += stats["code"]
+      total_comments += stats["comment"]
+    examples += stats["examples"]
+    max_nesting = max(max_nesting, stats["max_nesting"])
+    fn_count += stats["fn_count"]
+    hazards += stats["hazards"]
+    unsafe_imports += stats["unsafe_imports"]
+
+  return _summarize_census(
+      files_loc,
+      total_code,
+      total_comments,
+      examples,
+      max_nesting,
+      fn_count,
+      hazards,
+      unsafe_imports,
+      is_go,
+  )
+
+
 def cmd_scan_codebase(args: argparse.Namespace) -> None:
   path = Path(args.telemetry)
   data = load_telemetry(path)
@@ -443,24 +532,27 @@ def cmd_scan_codebase(args: argparse.Namespace) -> None:
   after_c = census.setdefault("after", {})
 
   if is_go:
-    if args.coverage_pct is not None:
-      stats["branch_coverage_pct"] = round(float(args.coverage_pct), 1)
-    else:
-      stats["branch_coverage_pct"] = after_c.get("branch_coverage_pct")
+    legacy_cov = after_c.get("statement_coverage_pct")
+    if legacy_cov is None:
+      # Backward compatibility: ledgers written before the rename only carry
+      # the historical "branch" key.
+      legacy_cov = after_c.get("branch_coverage_pct")
+    cov = (
+        round(float(args.coverage_pct), 1)
+        if args.coverage_pct is not None
+        else legacy_cov
+    )
+    stats["statement_coverage_pct"] = cov
+    stats["branch_coverage_pct"] = cov
     if args.lint_warnings is not None:
       stats["lint_warnings"] = int(args.lint_warnings)
     else:
       stats["lint_warnings"] = after_c.get("lint_warnings")
     after_c.update(stats)
   else:
-    existing_latent = before_c.get("latent_bugs_found")
-    if existing_latent is None:
-      existing_latent = sum(
-          1
-          for o in data.get("opportunities", [])
-          if o.get("category") == "latent_bug"
-      )
-    stats["latent_bugs_found"] = existing_latent
+    # latent_bugs_found is owned by 'log-opportunity'; scanning only refreshes
+    # measured code metrics so there is exactly one writer for that counter.
+    stats.pop("latent_bugs_found", None)
     before_c.update(stats)
 
   save_telemetry(path, data)
@@ -519,6 +611,7 @@ def cmd_log_test_run(args: argparse.Namespace) -> None:
   data["test_iterations"] = runs
   after_c = data.setdefault("census", {}).setdefault("after", {})
   if cov_val is not None:
+    after_c["statement_coverage_pct"] = cov_val
     after_c["branch_coverage_pct"] = cov_val
   if lint_val is not None:
     after_c["lint_warnings"] = lint_val
@@ -641,9 +734,75 @@ def cmd_set_story(args: argparse.Namespace) -> None:
   print("[telemetry] Updated first-person AI narrative chapters.")
 
 
-def compute_derived_metrics(data: dict) -> None:
-  now = time.time()
-  close_active_bucket(data, now)
+DIMENSION_META = (
+    (
+        "speed",
+        "Speed & PGO Throughput",
+        "⚡",
+        (
+            "Wall-clock runtime comparison across baseline, Struct-of-Arrays"
+            " (SoA) layout, and Go Profile-Guided Optimization (PGO)."
+        ),
+    ),
+    (
+        "memory",
+        "Memory Efficiency (RSS)",
+        "💾",
+        (
+            "Peak resident memory footprint with pre-allocated workspace"
+            " buffers and zero hot-loop heap allocations."
+        ),
+    ),
+    (
+        "safety",
+        "Memory Safety (Unsafe Import Audit)",
+        "🛡️",
+        (
+            "Go memory safety is enforced by the language; 0 imports of the"
+            " unsafe package guarantee no unchecked pointer arithmetic."
+        ),
+    ),
+    ("parity", "Output Parity & Determinism", "🎯", None),
+    (
+        "quality",
+        "Code Quality & Test Coverage",
+        "✅",
+        (
+            "Unit, integration, Example-function, and property-based rapid"
+            " suites with go vet / staticcheck zero-warning verification."
+        ),
+    ),
+    (
+        "hygiene",
+        "Code Hygiene & Documentation",
+        "📚",
+        (
+            "Exported symbols documented with Go doc comments and runnable"
+            " Example functions, targeting <=400 LOC per file."
+        ),
+    ),
+    (
+        "simplicity",
+        "Cognitive Simplicity",
+        "🧩",
+        (
+            "Decomposed deeply nested monolithic functions and mutable"
+            " globals into small, composable functions."
+        ),
+    ),
+    (
+        "cost",
+        "Compute Throughput Efficiency",
+        "☁️",
+        (
+            "Measured execution speedup and memory reduction per node"
+            " across benchmark stages."
+        ),
+    ),
+)
+
+
+def _finalize_completion(data: dict) -> None:
   after_scanned = bool(
       ((data.get("census") or {}).get("after") or {}).get("scanned")
   )
@@ -654,7 +813,9 @@ def compute_derived_metrics(data: dict) -> None:
   else:
     data.setdefault("completed_at", None)
 
-  # 1. Time buckets (measured wall-clock time; 0 minutes when a bucket was not run)
+
+def _compute_time_buckets(data: dict) -> tuple[list[dict], dict]:
+  """Aggregate measured wall-clock time into bucket rows and the ROI block."""
   sec_map = data.get("_bucket_seconds", {})
   time_buckets = []
   total_minutes = 0
@@ -673,178 +834,216 @@ def compute_derived_metrics(data: dict) -> None:
         "minutes": mins,
         "color": bcolor,
     })
-  data["time_buckets"] = time_buckets
-
-  # 2. Measured Agent Execution Time (no synthetic human-effort multiplier)
-  total_ai_hours = round(total_minutes / 60.0, 2)
-  data["roi"] = {
+  roi = {
       "total_ai_minutes": total_minutes,
-      "total_ai_hours": total_ai_hours,
+      "total_ai_hours": round(total_minutes / 60.0, 2),
       "active_buckets_count": active_buckets_count,
   }
+  return time_buckets, roi
 
-  # 3. Compute the 8 Scorecard Dimensions strictly from measured values
-  census = data.get("census") or {}
-  before_c = census.get("before") or {}
-  after_c = census.get("after") or {}
 
-  benches = data.get("benchmarks") or []
-  has_benches = len(benches) >= 2
-  if has_benches:
+def _score_speed(benches: list[dict]) -> dict:
+  if len(benches) >= 2:
     base_b = benches[0]
     final_b = benches[-1]
     base_ms = max(0.001, float(base_b.get("wall_time_ms", 0.0)))
     final_ms = max(0.001, float(final_b.get("wall_time_ms", 0.0)))
     speedup = round(base_ms / final_ms, 2)
-    speed_before_score = clamp_score(100.0 / max(1.0, speedup), 0, 100)
-    speed_after_score = clamp_score(
-        60.0 * speedup
-        if speedup < 1.0
-        else 60.0 + min(40.0, (speedup - 1.0) * 15.0),
-        0,
-        100,
-    )
-    speed_before_label = f"{base_b['wall_time_ms']} ms (1.0x)"
-    speed_after_label = f"{final_b['wall_time_ms']} ms ({speedup:.2f}x)"
-    speed_delta = (
-        f"{speedup:.2f}x Faster" if speedup >= 1.0 else f"{speedup:.2f}x Slower"
-    )
+    return {
+        "before_score": clamp_score(100.0 / max(1.0, speedup), 0, 100),
+        "before_label": f"{base_b['wall_time_ms']} ms (1.0x)",
+        "after_score": clamp_score(
+            SPEED_BONUS_BASE * speedup
+            if speedup < 1.0
+            else SPEED_BONUS_BASE
+            + min(SPEED_BONUS_CAP, (speedup - 1.0) * SPEED_BONUS_GAIN),
+            0,
+            100,
+        ),
+        "after_label": f"{final_b['wall_time_ms']} ms ({speedup:.2f}x)",
+        "delta_badge": (
+            f"{speedup:.2f}x Faster" if speedup >= 1.0 else f"{speedup:.2f}x Slower"
+        ),
+        "explanation": None,
+    }
+  return {
+      "before_score": None,
+      "before_label": (
+          f"{benches[0]['wall_time_ms']} ms" if benches else "Not measured"
+      ),
+      "after_score": None,
+      "after_label": "Not measured",
+      "delta_badge": "Not measured",
+      "explanation": None,
+  }
 
+
+def _score_memory(benches: list[dict]) -> dict:
+  if len(benches) >= 2:
+    base_b = benches[0]
+    final_b = benches[-1]
     rss_before = max(0.001, float(base_b.get("peak_rss_mb", 0.0)))
     rss_after = max(0.001, float(final_b.get("peak_rss_mb", 0.0)))
     rss_drop_pct = round((1.0 - rss_after / rss_before) * 100.0, 1)
-    mem_before_score = clamp_score(100.0 - max(0.0, rss_drop_pct), 0, 100)
-    mem_after_score = clamp_score(70.0 + rss_drop_pct * 0.3, 0, 100)
-    mem_before_label = f"{base_b['peak_rss_mb']} MB Peak RSS"
-    mem_after_label = f"{final_b['peak_rss_mb']} MB Peak RSS"
-    mem_delta = (
-        f"-{rss_drop_pct:.1f}% RAM"
-        if rss_drop_pct >= 0
-        else f"+{abs(rss_drop_pct):.1f}% RAM"
-    )
+    return {
+        "before_score": clamp_score(100.0 - max(0.0, rss_drop_pct), 0, 100),
+        "before_label": f"{base_b['peak_rss_mb']} MB Peak RSS",
+        "after_score": clamp_score(
+            MEMORY_AFTER_BASE + rss_drop_pct * MEMORY_AFTER_GAIN_PER_PCT, 0, 100
+        ),
+        "after_label": f"{final_b['peak_rss_mb']} MB Peak RSS",
+        "delta_badge": (
+            f"-{rss_drop_pct:.1f}% RAM"
+            if rss_drop_pct >= 0
+            else f"+{abs(rss_drop_pct):.1f}% RAM"
+        ),
+        "explanation": None,
+    }
+  return {
+      "before_score": None,
+      "before_label": (
+          f"{benches[0]['peak_rss_mb']} MB" if benches else "Not measured"
+      ),
+      "after_score": None,
+      "after_label": "Not measured",
+      "delta_badge": "Not measured",
+      "explanation": None,
+  }
 
-    compute_saved_pct = int(round((1.0 - final_ms / base_ms) * 100.0))
-    cost_before_score = None
-    cost_after_score = clamp_score(50.0 + compute_saved_pct * 0.5, 0, 100)
-    cost_before_label = "Not measured"
-    cost_after_label = f"{speedup:.2f}x Throughput / Node"
-    cost_delta = (
-        f"-{compute_saved_pct}% Compute Hrs"
-        if compute_saved_pct >= 0
-        else f"+{abs(compute_saved_pct)}% Compute Hrs"
-    )
-  else:
-    speedup = None
-    speed_before_score = None
-    speed_after_score = None
-    speed_before_label = (
-        f"{benches[0]['wall_time_ms']} ms" if benches else "Not measured"
-    )
-    speed_after_label = "Not measured"
-    speed_delta = "Not measured"
 
-    mem_before_score = None
-    mem_after_score = None
-    mem_before_label = (
-        f"{benches[0]['peak_rss_mb']} MB" if benches else "Not measured"
-    )
-    mem_after_label = "Not measured"
-    mem_delta = "Not measured"
-
-    cost_before_score = None
-    cost_after_score = None
-    cost_before_label = "Not measured"
-    cost_after_label = "Not measured"
-    cost_delta = "Not measured"
-
+def _score_safety(before_c: dict, after_c: dict) -> dict:
   hazards = before_c.get("hazards_count")
   unsafe_cnt = after_c.get("unsafe_imports")
+  result = {
+      "before_score": None,
+      "before_label": "Not measured",
+      "after_score": None,
+      "after_label": "Not measured",
+      "delta_badge": "Not measured",
+      "explanation": None,
+  }
   if hazards is not None:
-    safety_before_score = clamp_score(80.0 - float(hazards) * 2.5, 0, 100)
-    safety_before_label = f"{int(hazards)} Pointer/State Hazards"
-  else:
-    safety_before_score = None
-    safety_before_label = "Not measured"
-
+    result["before_score"] = clamp_score(
+        SAFETY_BEFORE_BASE - float(hazards) * SAFETY_HAZARD_WEIGHT, 0, 100
+    )
+    result["before_label"] = f"{int(hazards)} Pointer/State Hazards"
   if unsafe_cnt is not None:
     unsafe_int = int(unsafe_cnt)
-    safety_after_score = (
+    result["after_score"] = (
         100
         if unsafe_int == 0
-        else clamp_score(90.0 - unsafe_int * 10.0, 0, 100)
+        else clamp_score(
+            SAFETY_AFTER_BASE - unsafe_int * SAFETY_UNSAFE_WEIGHT, 0, 100
+        )
     )
-    safety_after_label = f"{unsafe_int} Unsafe Imports"
-    safety_delta = (
+    result["after_label"] = f"{unsafe_int} Unsafe Imports"
+    result["delta_badge"] = (
         "100% Safe Go" if unsafe_int == 0 else f"{unsafe_int} Unsafe Imports"
     )
-  else:
-    safety_after_score = None
-    safety_after_label = "Not measured"
-    safety_delta = "Not measured"
+  return result
 
-  parity_runs = data.get("parity_iterations") or []
+
+def _score_parity(parity_runs: list[dict]) -> dict:
   if parity_runs:
     last_p = parity_runs[-1]
     seeds_t = max(1, int(last_p.get("seeds_tested", 0)))
     seeds_p = int(last_p.get("seeds_passed", 0))
     parity_pct = round((seeds_p / seeds_t) * 100.0, 1)
-    parity_before_score = None
-    parity_after_score = clamp_score(parity_pct, 0, 100)
-    parity_before_label = "Not measured"
-    parity_after_label = f"{parity_pct}% across {seeds_t} Seeds"
-    parity_delta = f"{parity_pct}% Verified"
-    parity_expl = (
-        "Automated A/B differential harness verified output equivalence"
-        f" across {seeds_t} deterministic seeds."
-    )
-  else:
-    parity_before_score = None
-    parity_after_score = None
-    parity_before_label = "Not measured"
-    parity_after_label = "Not measured"
-    parity_delta = "Not measured"
-    parity_expl = (
-        "No A/B parity runs were logged. Run 'telemetry.py log-parity-run' to"
-        " record seed comparisons."
-    )
+    return {
+        "before_score": None,
+        "before_label": "Not measured",
+        "after_score": clamp_score(parity_pct, 0, 100),
+        "after_label": f"{parity_pct}% across {seeds_t} Seeds",
+        "delta_badge": f"{parity_pct}% Verified",
+        "explanation": (
+            "Automated A/B differential harness verified output equivalence"
+            f" across {seeds_t} deterministic seeds."
+        ),
+    }
+  return {
+      "before_score": None,
+      "before_label": "Not measured",
+      "after_score": None,
+      "after_label": "Not measured",
+      "delta_badge": "Not measured",
+      "explanation": (
+          "No A/B parity runs were logged. Run 'telemetry.py log-parity-run' to"
+          " record seed comparisons."
+      ),
+  }
 
-  cov_raw = after_c.get("branch_coverage_pct")
+
+def _normalize_coverage_keys(after_c: dict) -> None:
+  """Backfill the statement key from a legacy ledger so consumers see one name."""
+  if (
+      after_c.get("statement_coverage_pct") is None
+      and after_c.get("branch_coverage_pct") is not None
+  ):
+    after_c["statement_coverage_pct"] = after_c["branch_coverage_pct"]
+
+
+def _score_quality(after_c: dict) -> dict:
+  cov_raw = after_c.get("statement_coverage_pct")
+  if cov_raw is None:
+    # Backward compatibility with ledgers that only carry the legacy key.
+    cov_raw = after_c.get("branch_coverage_pct")
   lint_raw = after_c.get("lint_warnings")
   if cov_raw is not None and lint_raw is not None:
     cov_pct = round(float(cov_raw), 1)
     lint_w = int(lint_raw)
-    qual_before_score = None
-    qual_after_score = clamp_score(cov_pct - lint_w * 3.0, 0, 100)
-    qual_before_label = "Not measured"
-    qual_after_label = f"{cov_pct}% Coverage"
-    qual_delta = f"{lint_w} Lint Warnings • {cov_pct}% Cov"
-  else:
-    qual_before_score = None
-    qual_after_score = None
-    qual_before_label = "Not measured"
-    qual_after_label = "Not measured"
-    qual_delta = "Not measured"
+    return {
+        "before_score": None,
+        "before_label": "Not measured",
+        "after_score": clamp_score(
+            cov_pct - lint_w * QUALITY_LINT_WEIGHT, 0, 100
+        ),
+        "after_label": f"{cov_pct}% Coverage",
+        "delta_badge": f"{lint_w} Lint Warnings • {cov_pct}% Cov",
+        "explanation": None,
+    }
+  return {
+      "before_score": None,
+      "before_label": "Not measured",
+      "after_score": None,
+      "after_label": "Not measured",
+      "delta_badge": "Not measured",
+      "explanation": None,
+  }
 
+
+def _score_hygiene(before_c: dict, after_c: dict) -> dict:
   doc_before = before_c.get("comment_pct")
   doc_after = after_c.get("comment_pct")
   u400_before = before_c.get("files_under_400_pct")
   u400_after = after_c.get("files_under_400_pct")
+  result = {
+      "before_score": None,
+      "before_label": "Not measured",
+      "after_score": None,
+      "after_label": "Not measured",
+      "delta_badge": "Not measured",
+      "explanation": None,
+  }
   if doc_before is not None and u400_before is not None:
-    hygiene_before_score = clamp_score(
-        float(doc_before) * 2.0 + float(u400_before) * 0.4, 0, 100
+    result["before_score"] = clamp_score(
+        float(doc_before) * HYGIENE_BEFORE_DOC_WEIGHT
+        + float(u400_before) * HYGIENE_BEFORE_LOC_WEIGHT,
+        0,
+        100,
     )
-    hygiene_before_label = (
+    result["before_label"] = (
         f"{doc_before}% Comments • {before_c.get('max_file_loc', 0)} Max LOC"
     )
-  else:
-    hygiene_before_score = None
-    hygiene_before_label = "Not measured"
-
   if doc_after is not None and u400_after is not None:
-    hygiene_after_score = clamp_score(
-        float(u400_after) * 0.6 + min(40.0, float(doc_after) * 1.8), 0, 100
+    result["after_score"] = clamp_score(
+        float(u400_after) * HYGIENE_AFTER_LOC_WEIGHT
+        + min(
+            HYGIENE_DOC_CAP, float(doc_after) * HYGIENE_AFTER_DOC_WEIGHT
+        ),
+        0,
+        100,
     )
-    hygiene_after_label = (
+    result["after_label"] = (
         f"{doc_after}% Docs • {after_c.get('max_file_loc', 0)} Max LOC"
     )
     if doc_before is not None and float(doc_before) > 0:
@@ -854,178 +1053,170 @@ def compute_derived_metrics(data: dict) -> None:
               * 100.0
           )
       )
-      hygiene_delta = (
+      result["delta_badge"] = (
           f"+{doc_inc}% Docs" if doc_inc >= 0 else f"{doc_inc}% Docs"
       )
     else:
-      hygiene_delta = f"{doc_after}% Docs"
-  else:
-    hygiene_after_score = None
-    hygiene_after_label = "Not measured"
-    hygiene_delta = "Not measured"
+      result["delta_badge"] = f"{doc_after}% Docs"
+  return result
 
+
+def _score_simplicity(before_c: dict, after_c: dict) -> dict:
   nest_b = before_c.get("max_nesting_depth")
   fn_b = before_c.get("avg_fn_loc")
   nest_a = after_c.get("max_nesting_depth")
   fn_a = after_c.get("avg_fn_loc")
-
+  result = {
+      "before_score": None,
+      "before_label": "Not measured",
+      "after_score": None,
+      "after_label": "Not measured",
+      "delta_badge": "Not measured",
+      "explanation": None,
+  }
   if nest_b is not None and fn_b is not None:
-    simp_before_score = clamp_score(
-        100.0 - int(nest_b) * 5.0 - int(fn_b) * 0.3, 0, 100
-    )
-    simp_before_label = f"Depth {int(nest_b)} • {int(fn_b)} LOC/Fn"
-  else:
-    simp_before_score = None
-    simp_before_label = "Not measured"
-
-  if nest_a is not None and fn_a is not None:
-    simp_after_score = clamp_score(
-        100.0 - max(0, int(nest_a) - 2) * 4.0 - max(0, int(fn_a) - 20) * 0.4,
+    result["before_score"] = clamp_score(
+        100.0
+        - int(nest_b) * SIMPLICITY_BEFORE_NEST_WEIGHT
+        - int(fn_b) * SIMPLICITY_BEFORE_FN_WEIGHT,
         0,
         100,
     )
-    simp_after_label = f"Depth {int(nest_a)} • {int(fn_a)} LOC/Fn"
+    result["before_label"] = f"Depth {int(nest_b)} • {int(fn_b)} LOC/Fn"
+  if nest_a is not None and fn_a is not None:
+    result["after_score"] = clamp_score(
+        100.0
+        - max(0, int(nest_a) - SIMPLICITY_AFTER_NEST_FREE)
+        * SIMPLICITY_AFTER_NEST_WEIGHT
+        - max(0, int(fn_a) - SIMPLICITY_AFTER_FN_FREE)
+        * SIMPLICITY_AFTER_FN_WEIGHT,
+        0,
+        100,
+    )
+    result["after_label"] = f"Depth {int(nest_a)} • {int(fn_a)} LOC/Fn"
     if fn_b is not None and int(fn_b) > 0:
       fn_drop = int(round(((int(fn_b) - int(fn_a)) / int(fn_b)) * 100.0))
-      simp_delta = (
+      result["delta_badge"] = (
           f"-{fn_drop}% Fn Size"
           if fn_drop >= 0
           else f"+{abs(fn_drop)}% Fn Size"
       )
     else:
-      simp_delta = f"{int(fn_a)} LOC/Fn"
-  else:
-    simp_after_score = None
-    simp_after_label = "Not measured"
-    simp_delta = "Not measured"
+      result["delta_badge"] = f"{int(fn_a)} LOC/Fn"
+  return result
 
-  data["scorecard"] = [
-      {
-          "id": "speed",
-          "title": "Speed & PGO Throughput",
-          "icon": "⚡",
-          "before_score": speed_before_score,
-          "before_grade": grade_from_score(speed_before_score),
-          "before_label": speed_before_label,
-          "after_score": speed_after_score,
-          "after_grade": grade_from_score(speed_after_score),
-          "after_label": speed_after_label,
-          "delta_badge": speed_delta,
-          "explanation": (
-              "Wall-clock runtime comparison across baseline, Struct-of-Arrays"
-              " (SoA) layout, and Go Profile-Guided Optimization (PGO)."
-          ),
-      },
-      {
-          "id": "memory",
-          "title": "Memory Efficiency (RSS)",
-          "icon": "💾",
-          "before_score": mem_before_score,
-          "before_grade": grade_from_score(mem_before_score),
-          "before_label": mem_before_label,
-          "after_score": mem_after_score,
-          "after_grade": grade_from_score(mem_after_score),
-          "after_label": mem_after_label,
-          "delta_badge": mem_delta,
-          "explanation": (
-              "Peak resident memory footprint with pre-allocated workspace"
-              " buffers and zero hot-loop heap allocations."
-          ),
-      },
-      {
-          "id": "safety",
-          "title": "Memory Safety (Unsafe Import Audit)",
-          "icon": "🛡️",
-          "before_score": safety_before_score,
-          "before_grade": grade_from_score(safety_before_score),
-          "before_label": safety_before_label,
-          "after_score": safety_after_score,
-          "after_grade": grade_from_score(safety_after_score),
-          "after_label": safety_after_label,
-          "delta_badge": safety_delta,
-          "explanation": (
-              "Go memory safety is enforced by the language; 0 imports of the"
-              " unsafe package guarantee no unchecked pointer arithmetic."
-          ),
-      },
-      {
-          "id": "parity",
-          "title": "Output Parity & Determinism",
-          "icon": "🎯",
-          "before_score": parity_before_score,
-          "before_grade": grade_from_score(parity_before_score),
-          "before_label": parity_before_label,
-          "after_score": parity_after_score,
-          "after_grade": grade_from_score(parity_after_score),
-          "after_label": parity_after_label,
-          "delta_badge": parity_delta,
-          "explanation": parity_expl,
-      },
-      {
-          "id": "quality",
-          "title": "Code Quality & Test Coverage",
-          "icon": "✅",
-          "before_score": qual_before_score,
-          "before_grade": grade_from_score(qual_before_score),
-          "before_label": qual_before_label,
-          "after_score": qual_after_score,
-          "after_grade": grade_from_score(qual_after_score),
-          "after_label": qual_after_label,
-          "delta_badge": qual_delta,
-          "explanation": (
-              "Unit, integration, Example-function, and property-based rapid"
-              " suites with go vet / staticcheck zero-warning verification."
-          ),
-      },
-      {
-          "id": "hygiene",
-          "title": "Code Hygiene & Documentation",
-          "icon": "📚",
-          "before_score": hygiene_before_score,
-          "before_grade": grade_from_score(hygiene_before_score),
-          "before_label": hygiene_before_label,
-          "after_score": hygiene_after_score,
-          "after_grade": grade_from_score(hygiene_after_score),
-          "after_label": hygiene_after_label,
-          "delta_badge": hygiene_delta,
-          "explanation": (
-              "Exported symbols documented with Go doc comments and runnable"
-              " Example functions, targeting <=400 LOC per file."
-          ),
-      },
-      {
-          "id": "simplicity",
-          "title": "Cognitive Simplicity",
-          "icon": "🧩",
-          "before_score": simp_before_score,
-          "before_grade": grade_from_score(simp_before_score),
-          "before_label": simp_before_label,
-          "after_score": simp_after_score,
-          "after_grade": grade_from_score(simp_after_score),
-          "after_label": simp_after_label,
-          "delta_badge": simp_delta,
-          "explanation": (
-              "Decomposed deeply nested monolithic functions and mutable"
-              " globals into small, composable functions."
-          ),
-      },
-      {
-          "id": "cost",
-          "title": "Compute Throughput Efficiency",
-          "icon": "☁️",
-          "before_score": cost_before_score,
-          "before_grade": grade_from_score(cost_before_score),
-          "before_label": cost_before_label,
-          "after_score": cost_after_score,
-          "after_grade": grade_from_score(cost_after_score),
-          "after_label": cost_after_label,
-          "delta_badge": cost_delta,
-          "explanation": (
-              "Measured execution speedup and memory reduction per node"
-              " across benchmark stages."
-          ),
-      },
+
+def _score_cost(benches: list[dict]) -> dict:
+  if len(benches) >= 2:
+    base_b = benches[0]
+    final_b = benches[-1]
+    base_ms = max(0.001, float(base_b.get("wall_time_ms", 0.0)))
+    final_ms = max(0.001, float(final_b.get("wall_time_ms", 0.0)))
+    compute_saved_pct = int(round((1.0 - final_ms / base_ms) * 100.0))
+    return {
+        "before_score": None,
+        "before_label": "Not measured",
+        "after_score": clamp_score(
+            COST_AFTER_BASE
+            + compute_saved_pct * COST_AFTER_GAIN_PER_PCT,
+            0,
+            100,
+        ),
+        "after_label": f"{round(base_ms / final_ms, 2):.2f}x Throughput / Node",
+        "delta_badge": (
+            f"-{compute_saved_pct}% Compute Hrs"
+            if compute_saved_pct >= 0
+            else f"+{abs(compute_saved_pct)}% Compute Hrs"
+        ),
+        "explanation": None,
+    }
+  return {
+      "before_score": None,
+      "before_label": "Not measured",
+      "after_score": None,
+      "after_label": "Not measured",
+      "delta_badge": "Not measured",
+      "explanation": None,
+  }
+
+
+def _build_scorecard(measured: dict[str, dict]) -> list[dict]:
+  cards = []
+  for dim_id, title, icon, explanation in DIMENSION_META:
+    scores = measured[dim_id]
+    cards.append({
+        "id": dim_id,
+        "title": title,
+        "icon": icon,
+        "before_score": scores["before_score"],
+        "before_grade": grade_from_score(scores["before_score"]),
+        "before_label": scores["before_label"],
+        "after_score": scores["after_score"],
+        "after_grade": grade_from_score(scores["after_score"]),
+        "after_label": scores["after_label"],
+        "delta_badge": scores["delta_badge"],
+        "explanation": (
+            scores["explanation"]
+            if scores["explanation"] is not None
+            else explanation
+        ),
+    })
+  return cards
+
+
+def _compute_overall_summary(cards: list[dict]) -> dict:
+  before = [
+      card["before_score"]
+      for card in cards
+      if card.get("before_score") is not None
   ]
+  after = [
+      card["after_score"]
+      for card in cards
+      if card.get("after_score") is not None
+  ]
+  before_avg = int(round(sum(before) / len(before))) if before else None
+  after_avg = int(round(sum(after) / len(after))) if after else None
+  return {
+      "before_avg": before_avg,
+      "before_grade": grade_from_score(before_avg),
+      "after_avg": after_avg,
+      "after_grade": grade_from_score(after_avg),
+  }
+
+
+def compute_derived_metrics(data: dict) -> None:
+  """Compute every derived block from measured telemetry (single entry point)."""
+  now = time.time()
+  close_active_bucket(data, now)
+  _finalize_completion(data)
+
+  time_buckets, roi = _compute_time_buckets(data)
+  data["time_buckets"] = time_buckets
+  data["roi"] = roi
+
+  census = data.get("census") or {}
+  before_c = census.get("before") or {}
+  after_c = census.get("after") or {}
+  _normalize_coverage_keys(after_c)
+  benches = data.get("benchmarks") or []
+  parity_runs = data.get("parity_iterations") or []
+
+  measured = {
+      "speed": _score_speed(benches),
+      "memory": _score_memory(benches),
+      "safety": _score_safety(before_c, after_c),
+      "parity": _score_parity(parity_runs),
+      "quality": _score_quality(after_c),
+      "hygiene": _score_hygiene(before_c, after_c),
+      "simplicity": _score_simplicity(before_c, after_c),
+      "cost": _score_cost(benches),
+  }
+  cards = _build_scorecard(measured)
+  data["scorecard"] = cards
+  summary = _compute_overall_summary(cards)
+  data["overall"] = summary
+  data["summary_grade"] = summary["after_grade"]
 
 
 def render_infographic_from_template(tpl_path: Path, data: dict) -> str:

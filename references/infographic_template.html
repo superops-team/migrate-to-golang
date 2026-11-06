@@ -870,16 +870,6 @@
       }
     }
 
-    function gradeFromScore(s) {
-      if (s === null || s === undefined) return 'N/A';
-      if (s >= 95) return 'A+';
-      if (s >= 90) return 'A';
-      if (s >= 80) return 'B';
-      if (s >= 70) return 'C';
-      if (s >= 55) return 'D';
-      return 'F';
-    }
-
     function renderAll() {
       if (!DATA) {
         const mainEl = document.querySelector('main');
@@ -979,8 +969,11 @@
       }
 
       const parityRuns = DATA.parity_iterations || [];
-      const covText = (afterCensus.branch_coverage_pct !== null && afterCensus.branch_coverage_pct !== undefined)
-        ? `${afterCensus.branch_coverage_pct}% coverage`
+      const covRaw = (afterCensus.statement_coverage_pct !== null && afterCensus.statement_coverage_pct !== undefined)
+        ? afterCensus.statement_coverage_pct
+        : afterCensus.branch_coverage_pct;
+      const covText = (covRaw !== null && covRaw !== undefined)
+        ? `${covRaw}% statement coverage`
         : 'Coverage not measured';
       if (parityRuns.length > 0) {
         const lastParity = parityRuns[parityRuns.length - 1];
@@ -1019,13 +1012,10 @@
       }
       const gridEl = document.getElementById('scorecard-grid');
       gridEl.innerHTML = '';
-      let sumBefore = 0, countBefore = 0, sumAfter = 0, countAfter = 0;
 
       scorecard.forEach(item => {
         const hasBefore = item.before_score !== null && item.before_score !== undefined;
         const hasAfter = item.after_score !== null && item.after_score !== undefined;
-        if (hasBefore) { sumBefore += item.before_score; countBefore++; }
-        if (hasAfter) { sumAfter += item.after_score; countAfter++; }
         const beforeScoreText = hasBefore ? `${item.before_score}/100 (${item.before_grade})` : 'Not measured';
         const afterScoreText = hasAfter ? `${item.after_score}/100 (${item.after_grade})` : 'Not measured';
         const barWidth = hasAfter ? item.after_score : 0;
@@ -1062,13 +1052,16 @@
         gridEl.appendChild(card);
       });
 
-      const avgBefore = countBefore > 0 ? Math.round(sumBefore / countBefore) : null;
-      const avgAfter = countAfter > 0 ? Math.round(sumAfter / countAfter) : null;
+      // Overall sums and grades are computed once by the backend (DATA.overall)
+      // so the summary can never disagree with the dimension cards.
+      const overall = DATA.overall || {};
+      const avgBefore = (overall.before_avg !== null && overall.before_avg !== undefined) ? overall.before_avg : null;
+      const avgAfter = (overall.after_avg !== null && overall.after_avg !== undefined) ? overall.after_avg : null;
       document.getElementById('overall-before-score').textContent = avgBefore !== null
-        ? `Legacy: ${avgBefore}/100 (${gradeFromScore(avgBefore)})`
+        ? `Legacy: ${avgBefore}/100 (${overall.before_grade})`
         : 'Legacy: Not measured';
       document.getElementById('overall-after-score').textContent = avgAfter !== null
-        ? `Safe Go: ${avgAfter}/100 (${gradeFromScore(avgAfter)})`
+        ? `Safe Go: ${avgAfter}/100 (${overall.after_grade})`
         : 'Safe Go: Not measured';
 
       // Chapter 1 Metrics & Opportunities

@@ -7,26 +7,16 @@ the Go Profile-Guided Optimization (PGO) pipeline.
 
 ## Table of Contents
 
--   [1. Core Engineering & Verification Standards](#1-core-engineering--verification-standards):
-    Lines 33-102
--   [2. Stage 1 Architectural Blueprint Specification (6 Sections)](#2-stage-1-architectural-blueprint-specification-6-sections):
-    Lines 104-141
--   [3. Continuous Telemetry Lifecycle (`scripts/telemetry.py`)](#3-continuous-telemetry-lifecycle-scriptstelemetrypy):
-    Lines 143-281
-    -   [Step A: Initialize Telemetry & Scan Legacy Codebase (`discovery` Bucket)](#step-a-initialize-telemetry--scan-legacy-codebase-discovery-bucket):
-        Lines 150-183
-    -   [Step B: Log Opportunities & Latent Legacy Bugs (`blueprint` Bucket)](#step-b-log-opportunities--latent-legacy-bugs-blueprint-bucket):
-        Lines 184-208
-    -   [Step C: Safe Go Rewrite & Modularization (`rewrite` Bucket)](#step-c-safe-go-rewrite--modularization-rewrite-bucket):
-        Lines 209-224
-    -   [Step D: Log Every Test Run & Self-Healing Fix (`test_heal` Bucket)](#step-d-log-every-test-run--self-healing-fix-test_heal-bucket):
-        Lines 225-251
-    -   [Step E: Log A/B Differential Parity Iterations (`parity` Bucket)](#step-e-log-ab-differential-parity-iterations-parity-bucket):
-        Lines 252-281
--   [4. Profile-Guided Optimization (PGO) Workflow (`pgo_bench` Bucket)](#4-profile-guided-optimization-pgo-workflow-pgo_bench-bucket):
-    Lines 283-361
--   [5. Final Census, First-Person Story & Infographic Generation](#5-final-census-first-person-story--infographic-generation):
-    Lines 363-415
+-   [1. Core Engineering & Verification Standards](#1-core-engineering--verification-standards)
+-   [2. Stage 1 Architectural Blueprint Specification (6 Sections)](#2-stage-1-architectural-blueprint-specification-6-sections)
+-   [3. Continuous Telemetry Lifecycle (`scripts/telemetry.py`)](#3-continuous-telemetry-lifecycle-scriptstelemetrypy)
+    -   [Step A: Initialize Telemetry & Scan Legacy Codebase (`discovery` Bucket)](#step-a-initialize-telemetry--scan-legacy-codebase-discovery-bucket)
+    -   [Step B: Log Opportunities & Latent Legacy Bugs (`blueprint` Bucket)](#step-b-log-opportunities--latent-legacy-bugs-blueprint-bucket)
+    -   [Step C: Safe Go Rewrite & Modularization (`rewrite` Bucket)](#step-c-safe-go-rewrite--modularization-rewrite-bucket)
+    -   [Step D: Log Every Test Run & Self-Healing Fix (`test_heal` Bucket)](#step-d-log-every-test-run--self-healing-fix-test_heal-bucket)
+    -   [Step E: Log A/B Differential Parity Iterations (`parity` Bucket)](#step-e-log-ab-differential-parity-iterations-parity-bucket)
+-   [4. Profile-Guided Optimization (PGO) Workflow (`pgo_bench` Bucket)](#4-profile-guided-optimization-pgo-workflow-pgo_bench-bucket)
+-   [5. Final Census, First-Person Story & Infographic Generation](#5-final-census-first-person-story--infographic-generation)
 
 --------------------------------------------------------------------------------
 
